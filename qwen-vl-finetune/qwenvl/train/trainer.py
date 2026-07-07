@@ -1,7 +1,14 @@
+import json
+from collections import defaultdict
+from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple, Callable
 
 import torch
-from flash_attn.flash_attn_interface import flash_attn_varlen_func
+import torch.nn.functional as F
+try:
+    from flash_attn.flash_attn_interface import flash_attn_varlen_func
+except ImportError:  # pragma: no cover - optional dependency
+    flash_attn_varlen_func = None
 from transformers.modeling_flash_attention_utils import FlashAttentionKwargs
 from transformers import Trainer
 from transformers.cache_utils import Cache
@@ -28,6 +35,8 @@ from transformers.models.qwen3_vl_moe.modeling_qwen3_vl_moe import (
 from transformers.utils import logging
 
 logger = logging.get_logger(__name__)
+_SKILL_LOG_ORDER = ("observing", "estimating", "scheduler", "planning")
+_SKILL_LOG_INDEX = {name: idx for idx, name in enumerate(_SKILL_LOG_ORDER)}
 
 
 def flash_attention_forward(
@@ -42,6 +51,11 @@ def flash_attention_forward(
     softcap: Optional[float] = None,
     **kwargs,
 ) -> tuple[torch.Tensor, None]:
+    if flash_attn_varlen_func is None:
+        raise ImportError(
+            "flash_attn is required when using flattened/packed attention patching. "
+            "Install flash_attn or keep data_flatten=False and data_packing=False."
+        )
     if kwargs.get("output_attentions", False) or kwargs.get("head_mask") is not None:
         logger.warning_once(
             "`flash_attention_2` does not support `output_attentions=True` or `head_mask`."
@@ -489,6 +503,272 @@ def create_optimizer(self):
         self.optimizer = optimizer_cls(optimizer_grouped_parameters, **optimizer_kwargs)
 
     return self.optimizer
+
+
+class SkillAwareTrainer(Trainer):
+    """Trainer with per-skill loss accounting for NavAgent multitask SFT."""
+
+    def __init__(
+        self,
+        *args,
+        skill_evaluator=None,
+        skill_loss_weights: Optional[Dict[str, float]] = None,
+        **kwargs,
+    ):
+        super().__init__(*args, **kwargs)
+        self._skill_loss_totals = defaultdict(
+            lambda: {"loss_sum": 0.0, "token_count": 0.0}
+        )
+        self._skill_log_path = Path(self.args.output_dir) / "skill_loss_history.jsonl"
+        #: Optional SkillGenerationEvaluator. Set from train_qwen.py and consumed
+        #: inside evaluate() below. When None, evaluate() falls back to the
+        #: default HF behaviour (so we don't break users who pass an eval_dataset).
+        self.skill_evaluator = skill_evaluator
+
+        # Per-skill loss weights, normalized to mean=1. When empty, disabled.
+        # Normalization keeps the aggregate loss magnitude (and hence the
+        # effective LR) constant regardless of the user's weight scale; only
+        # the RELATIVE contribution of each skill changes.
+        self._skill_loss_weights: Dict[str, float] = {}
+        if skill_loss_weights:
+            normalized = {
+                self._normalize_skill_name(k): float(v)
+                for k, v in skill_loss_weights.items()
+                if float(v) > 0
+            }
+            if normalized:
+                mean_w = sum(normalized.values()) / len(normalized)
+                self._skill_loss_weights = {
+                    k: v / mean_w for k, v in normalized.items()
+                }
+                if self.is_world_process_zero():
+                    logger.info(
+                        "SkillAwareTrainer normalized skill_loss_weights "
+                        f"(mean=1): {self._skill_loss_weights}"
+                    )
+
+    @staticmethod
+    def _normalize_skill_name(name: Optional[str]) -> str:
+        if not name:
+            return "unknown"
+        skill = str(name).strip().lower()
+        if skill.startswith("navagent_"):
+            skill = skill[len("navagent_") :]
+        return skill or "unknown"
+
+    def _accumulate_skill_losses(
+        self,
+        logits: Optional[torch.Tensor],
+        labels: Optional[torch.Tensor],
+        skills: Optional[Sequence[str]],
+    ) -> None:
+        if logits is None or labels is None or not skills:
+            return
+        if logits.dim() != 3 or labels.dim() != 2:
+            return
+        if logits.size(0) != len(skills):
+            return
+
+        with torch.no_grad():
+            # NOTE: avoid .contiguous() on the full [B, L, V] slice.
+            # For Qwen3-VL with V~152k and L up to 16k that copy is ~5GB in bf16
+            # and was the main driver of the DeepSpeed "allocator cache flushes"
+            # warnings we saw. slicing preserves a reshape-compatible layout, so
+            # flatten/reshape below work without a copy.
+            shift_logits = logits[..., :-1, :].detach()
+            shift_labels = labels[..., 1:].detach()
+
+            vocab_size = shift_logits.size(-1)
+            # Upcast to fp32 before cross_entropy. The HF model computes its own
+            # loss in fp32 (via logits.float()), but this recompute previously ran
+            # in bf16; over Qwen3-VL's ~152k vocab the bf16 log_softmax overflows
+            # to inf -> nan, which is why loss_total was finite but per-skill
+            # losses logged as nan. This path is under no_grad/detach so it only
+            # affects logging, never the real gradients.
+            token_losses = F.cross_entropy(
+                shift_logits.reshape(-1, vocab_size).float(),
+                shift_labels.reshape(-1),
+                ignore_index=-100,
+                reduction="none",
+            ).view_as(shift_labels)
+            valid_mask = shift_labels.ne(-100)
+
+            loss_sums = torch.zeros(
+                len(_SKILL_LOG_ORDER),
+                device=token_losses.device,
+                dtype=torch.float64,
+            )
+            token_counts = torch.zeros(
+                len(_SKILL_LOG_ORDER),
+                device=token_losses.device,
+                dtype=torch.float64,
+            )
+
+            for sample_idx, skill_name in enumerate(skills):
+                skill = self._normalize_skill_name(skill_name)
+                skill_idx = _SKILL_LOG_INDEX.get(skill)
+                if skill_idx is None:
+                    continue
+                sample_mask = valid_mask[sample_idx]
+                if not sample_mask.any():
+                    continue
+                loss_sums[skill_idx] += token_losses[sample_idx][sample_mask].sum(
+                    dtype=torch.float64
+                )
+                token_counts[skill_idx] += sample_mask.to(torch.float64).sum()
+
+            if hasattr(self, "accelerator") and self.accelerator is not None:
+                loss_sums = self.accelerator.reduce(loss_sums, reduction="sum")
+                token_counts = self.accelerator.reduce(token_counts, reduction="sum")
+
+            if self.is_world_process_zero():
+                for skill, idx in _SKILL_LOG_INDEX.items():
+                    count = float(token_counts[idx].item())
+                    if count <= 0:
+                        continue
+                    self._skill_loss_totals[skill]["loss_sum"] += float(
+                        loss_sums[idx].item()
+                    )
+                    self._skill_loss_totals[skill]["token_count"] += count
+
+    def _should_accumulate_skill_losses(self) -> bool:
+        """Only run the per-skill cross-entropy on micro-batches that belong to
+        the optimizer step whose result will actually be logged. This avoids
+        re-computing a full [L, V] softmax on every micro-batch (with
+        gradient_accumulation_steps=8 and logging_steps=10 this drops the
+        overhead by ~90%) and skips the 5GB logits materialization entirely
+        on the other steps so the fused-loss path inside the HF model can run.
+        """
+        logging_steps = getattr(self.args, "logging_steps", 0) or 0
+        if logging_steps <= 0:
+            return False
+        # state.global_step is incremented AFTER the optimizer step, so during
+        # the micro-batches that feed step (global_step + 1) we want to match
+        # "next step is a logging step".
+        next_step = int(self.state.global_step) + 1
+        return next_step % int(logging_steps) == 0
+
+    def compute_loss(
+        self,
+        model,
+        inputs,
+        return_outputs: bool = False,
+        num_items_in_batch=None,
+    ):
+        skills = inputs.pop("skills", None)
+        accumulate = self._should_accumulate_skill_losses()
+        outputs = model(**inputs)
+        loss = outputs["loss"] if isinstance(outputs, dict) else outputs.loss
+
+        if accumulate:
+            logits = (
+                outputs.get("logits")
+                if isinstance(outputs, dict)
+                else outputs.logits
+            )
+            self._accumulate_skill_losses(
+                logits=logits,
+                labels=inputs.get("labels"),
+                skills=skills,
+            )
+
+        # Apply per-skill loss weighting. At per_device_train_batch_size=1 the
+        # micro-batch has exactly one sample, so one skill key; if ever scaled
+        # up we average the per-sample weights. Skills not listed in the config
+        # default to 1.0 (unchanged contribution).
+        if self._skill_loss_weights and skills:
+            weights = [
+                self._skill_loss_weights.get(
+                    self._normalize_skill_name(s), 1.0
+                )
+                for s in skills
+            ]
+            scale = sum(weights) / len(weights)
+            if scale != 1.0:
+                loss = loss * scale
+
+        return (loss, outputs) if return_outputs else loss
+
+    def evaluate(
+        self,
+        eval_dataset=None,
+        ignore_keys=None,
+        metric_key_prefix: str = "eval",
+    ) -> Dict[str, float]:
+        """Override HF's evaluate() to run the skill generation evaluator.
+
+        We intentionally do NOT call super().evaluate() when a skill evaluator
+        is configured, because:
+        * we have no classic eval_dataset in the HF sense,
+        * the HF loop would do a teacher-forced loss pass which we already
+          compute during training via compute_loss, and
+        * our per-skill success rate requires generation + JSON parsing that
+          doesn't fit the prediction_step interface.
+
+        When ``self.skill_evaluator`` is None we defer to the parent Trainer
+        so callers using a normal eval_dataset still work.
+        """
+        if self.skill_evaluator is None:
+            return super().evaluate(
+                eval_dataset=eval_dataset,
+                ignore_keys=ignore_keys,
+                metric_key_prefix=metric_key_prefix,
+            )
+
+        # Run the custom evaluator. It handles distributed sharding, gathers
+        # params under ZeRO-3 and returns already-reduced metrics.
+        metrics = self.skill_evaluator.run(trainer=self)
+
+        # Normalize keys to <metric_key_prefix>_<...>. The evaluator already
+        # produces keys starting with "eval_"; if the caller wants a different
+        # prefix we honor it.
+        if metric_key_prefix != "eval":
+            metrics = {
+                key.replace("eval_", f"{metric_key_prefix}_", 1)
+                if key.startswith("eval_")
+                else key: value
+                for key, value in metrics.items()
+            }
+
+        # Pipe through our own log() so metrics land in trainer_state.json,
+        # tensorboard (if enabled) and skill_loss_history.jsonl.
+        self.log(metrics)
+        self.control = self.callback_handler.on_evaluate(
+            self.args, self.state, self.control, metrics
+        )
+        return metrics
+
+    def log(self, logs: Dict[str, float], *args, **kwargs) -> None:
+        logs = dict(logs)
+        if "loss" in logs and "loss_total" not in logs:
+            logs["loss_total"] = logs["loss"]
+
+        if self.is_world_process_zero():
+            for skill in _SKILL_LOG_ORDER:
+                token_count = self._skill_loss_totals[skill]["token_count"]
+                if token_count <= 0:
+                    continue
+                logs[f"loss_{skill}"] = (
+                    self._skill_loss_totals[skill]["loss_sum"] / token_count
+                )
+
+        payload = {
+            "step": int(self.state.global_step),
+            **logs,
+        }
+        if self.state.epoch is not None:
+            payload["epoch"] = float(self.state.epoch)
+
+        super().log(logs, *args, **kwargs)
+
+        if self.is_world_process_zero():
+            self._skill_log_path.parent.mkdir(parents=True, exist_ok=True)
+            with self._skill_log_path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(payload, ensure_ascii=False) + "\n")
+
+        self._skill_loss_totals = defaultdict(
+            lambda: {"loss_sum": 0.0, "token_count": 0.0}
+        )
 
 
 # Apply monkey patches

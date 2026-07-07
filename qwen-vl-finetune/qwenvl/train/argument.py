@@ -13,6 +13,16 @@ class ModelArguments:
 @dataclass
 class DataArguments:
     dataset_use: str = field(default="")
+    dataset_resample_weights: str = field(
+        default="",
+        metadata={
+            "help": (
+                "Comma-separated dataset or skill weights, e.g. "
+                "'observing=1,estimating=1,scheduler=1,planning=1' or "
+                "'navagent_observing=1,navagent_planning=2'."
+            )
+        },
+    )
     data_flatten: bool = field(default=False)
     data_packing: bool = field(default=False)
     base_interval: int = field(default=2)
@@ -23,6 +33,74 @@ class DataArguments:
     video_max_pixels: int = field(default=1024 * 28 * 28)
     video_min_pixels: int = field(default=256 * 28 * 28)
     video_fps: float = 2
+
+    # --- Skill generation eval (periodic success-rate check) ----------------
+    eval_val_dir: Optional[str] = field(
+        default=None,
+        metadata={
+            "help": (
+                "Directory containing navagent_<skill>_val.jsonl files produced "
+                "by tools/split_navagent_val.py. When set, a generation-based "
+                "eval callback is attached to the trainer."
+            )
+        },
+    )
+    eval_skills: str = field(
+        default="estimating,planning",
+        metadata={
+            "help": "Comma-separated list of skills to generate+score on val."
+        },
+    )
+    eval_num_samples_per_skill: int = field(
+        default=300,
+        metadata={
+            "help": "Max val samples evaluated per skill per eval cycle."
+        },
+    )
+    eval_max_new_tokens: int = field(
+        default=512,
+        metadata={"help": "max_new_tokens passed to model.generate() during eval."},
+    )
+    eval_train_probe_size: int = field(
+        default=0,
+        metadata={
+            "help": (
+                "If > 0, ALSO probe the train split each eval cycle by "
+                "running generate on this many fixed samples drawn from "
+                "navagent_<skill>_train.jsonl. The gap between train_acc "
+                "and val_acc tells us whether the model is fitting the "
+                "data at all (vs. just generalizing). Set to 0 to disable."
+            )
+        },
+    )
+    eval_planning_pixel_tolerance: float = field(
+        default=64.0,
+        metadata={
+            "help": (
+                "L2 (Euclidean) pixel tolerance for planning's target_pixel "
+                "during periodic eval. A predicted pixel counts as 'pixel "
+                "correct' iff its L2 distance to the oracle pixel is strictly "
+                "less than this many pixels. Default 64 ≈ 10% of the 640px "
+                "image width. Joint accuracy (the headline planning metric) "
+                "additionally requires direction to match."
+            )
+        },
+    )
+
+    # --- Per-skill loss weighting (scales compute_loss by skill) ------------
+    skill_loss_weights: str = field(
+        default="",
+        metadata={
+            "help": (
+                "Comma-separated per-skill loss weights, e.g. "
+                "'observing=1,estimating=2,scheduler=2,planning=2'. Weights are "
+                "normalized so that mean(weights)=1 across the listed skills, "
+                "which keeps the effective learning rate constant while changing "
+                "the relative gradient contribution of each skill. Leave empty "
+                "to disable (all skills weighted equally)."
+            )
+        },
+    )
 
 
 @dataclass

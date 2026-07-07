@@ -1,0 +1,87 @@
+# ========= Python =========
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg
+*.egg-info/
+.eggs/
+dist/
+build/
+pip-wheel-metadata/
+*.whl
+
+# ========= 虚拟环境 =========
+.venv/
+venv/
+env/
+ENV/
+.conda/
+
+# ========= 编辑器/IDE =========
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+Thumbs.db
+
+# ========= Jupyter =========
+.ipynb_checkpoints/
+
+# ========= 训练日志与输出 =========
+*.log
+logs/
+runs/
+output/
+outputs/
+wandb/
+tensorboard/
+tb_logs/
+
+# ========= 数据/权重/模型等大文件 =========
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.bin
+*.onnx
+*.npy
+*.npz
+*.h5
+*.hdf5
+*.parquet
+*.pkl
+*.pickle
+*.jsonl
+*.tar
+*.tar.gz
+*.zip
+*.7z
+
+# 数据集/权重目录
+data/
+datasets/
+checkpoints/
+pretrained/
+
+# ========= 临时文件 =========
+tmp/
+temp/
+cache/
+.cache/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ========= 环境变量 / 密钥 =========
+.env
+.env.*
+*.pem
+*.key
+
+# ========= 其他 =========
+nohup.out
+core
+*.core

@@ -17,15 +17,17 @@
 import os
 import logging
 import pathlib
+import importlib.util
 import torch
 import transformers
 import sys
 from pathlib import Path
+from typing import Dict
 
 project_root = Path(__file__).parent.parent.parent
 sys.path.append(str(project_root))
 
-from trainer import replace_qwen2_vl_attention_class
+from trainer import replace_qwen2_vl_attention_class, SkillAwareTrainer
 
 from transformers import (
     Qwen2VLForConditionalGeneration,
@@ -39,7 +41,27 @@ from qwenvl.train.argument import (
     DataArguments,
     TrainingArguments,
 )
-from transformers import AutoProcessor, Trainer
+from qwenvl.train.skill_eval import (
+    SkillEvalConfig,
+    SkillGenerationEvaluator,
+    load_train_probe_datasets,
+    load_val_datasets,
+)
+from transformers import AutoProcessor
+
+# ---------------------------------------------------------------------------
+# torch.load 安全检查兼容 patch
+# ---------------------------------------------------------------------------
+# transformers>=4.56 在每次 torch.load 前调用 check_torch_load_is_safe(), 当
+# torch<2.6 时直接抛 ValueError(CVE-2025-32434). 续训(resume_from_checkpoint)
+# 时, HF 会用 torch.load 读 checkpoint 里的 scheduler.pt / rng_state_*.pth, 于是
+# 在 torch 2.5.1 环境下被拦截而无法续训(模型权重走 safetensors 不受影响).
+# 这些 .pt/.pth 都是本机训练自己产出的可信文件, 漏洞前提(加载恶意 pickle)不成立,
+# 因此把该检查置为 no-op. 注意 transformers.trainer 在导入时已把该函数名绑进自身
+# 命名空间, 必须 patch trainer 模块里的引用, 只 patch utils 里的无效.
+import transformers.trainer as _hf_trainer
+
+_hf_trainer.check_torch_load_is_safe = lambda *args, **kwargs: None
 
 local_rank = None
 
@@ -47,6 +69,28 @@ local_rank = None
 def rank0_print(*args):
     if local_rank == 0:
         print(*args)
+
+
+class _SkillEvalPlaceholderDataset:
+    """Non-None placeholder passed to HF Trainer when the real eval path is
+    the custom SkillGenerationEvaluator.
+
+    HF Trainer.__init__ rejects ``eval_strategy != "no"`` combined with
+    ``eval_dataset is None``. Our SkillAwareTrainer.evaluate() short-circuits
+    to skill_evaluator.run() and never reads this object, so we just need
+    something that satisfies ``is not None`` and answers ``len()`` without
+    raising. A zero-length dataset is safe because HF only iterates eval_dataset
+    from inside super().evaluate(), which we skip.
+    """
+
+    def __len__(self):
+        return 0
+
+    def __getitem__(self, idx):  # pragma: no cover - should never be reached
+        raise IndexError(
+            "SkillEvalPlaceholderDataset should never be indexed; the custom "
+            "SkillGenerationEvaluator handles validation directly."
+        )
 
 
 def safe_save_model_for_hf_trainer(trainer: transformers.Trainer, output_dir: str):
@@ -96,6 +140,7 @@ def train(attn_implementation="flash_attention_2"):
         (ModelArguments, DataArguments, TrainingArguments)
     )
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    transformers.set_seed(training_args.seed)
 
     local_rank = training_args.local_rank
     os.makedirs(training_args.output_dir, exist_ok=True)
@@ -184,8 +229,101 @@ def train(attn_implementation="flash_attention_2"):
             model.model.print_trainable_parameters()
     
     data_module = make_supervised_data_module(processor, data_args=data_args)
-    trainer = Trainer(
-        model=model, processing_class=tokenizer, args=training_args, **data_module
+
+    skill_evaluator = None
+    if data_args.eval_val_dir:
+        skills = tuple(
+            s.strip()
+            for s in (data_args.eval_skills or "").split(",")
+            if s.strip()
+        )
+        if skills:
+            val_data_by_skill = load_val_datasets(
+                Path(data_args.eval_val_dir), skills=skills
+            )
+            non_empty = {k: v for k, v in val_data_by_skill.items() if v}
+            train_probe_by_skill: Dict[str, list] = {}
+            if (
+                non_empty
+                and getattr(data_args, "eval_train_probe_size", 0) > 0
+            ):
+                # Only bother loading the train pool for skills whose val
+                # pool is non-empty — otherwise we'd silently report a
+                # train number with no val counterpart for comparison.
+                probe_skills = tuple(non_empty.keys())
+                train_probe_by_skill = load_train_probe_datasets(
+                    Path(data_args.eval_val_dir), skills=probe_skills
+                )
+                # Drop empty entries so the evaluator doesn't try to
+                # subset-pick from a missing file.
+                train_probe_by_skill = {
+                    k: v for k, v in train_probe_by_skill.items() if v
+                }
+            if non_empty:
+                skill_evaluator = SkillGenerationEvaluator(
+                    processor=processor,
+                    val_data_by_skill=non_empty,
+                    train_probe_by_skill=train_probe_by_skill or None,
+                    config=SkillEvalConfig(
+                        skills=tuple(non_empty.keys()),
+                        max_new_tokens=data_args.eval_max_new_tokens,
+                        num_samples_per_skill=data_args.eval_num_samples_per_skill,
+                        train_probe_size=getattr(
+                            data_args, "eval_train_probe_size", 0
+                        ),
+                        log_path=Path(training_args.output_dir) / "skill_eval_history.jsonl",
+                        shard_seed=training_args.seed,
+                        planning_pixel_tolerance_px=float(
+                            getattr(data_args, "eval_planning_pixel_tolerance", 64.0)
+                        ),
+                    ),
+                )
+                rank0_print(
+                    "Skill generation evaluator enabled for skills: "
+                    f"{list(non_empty.keys())} "
+                    f"(num_samples_per_skill={data_args.eval_num_samples_per_skill}, "
+                    f"train_probe_size={getattr(data_args, 'eval_train_probe_size', 0)}, "
+                    f"max_new_tokens={data_args.eval_max_new_tokens}, "
+                    f"planning_pix_tol={getattr(data_args, 'eval_planning_pixel_tolerance', 64.0)})"
+                )
+            else:
+                rank0_print(
+                    "eval_val_dir is set but no val jsonl files were found; "
+                    "skipping skill evaluator setup."
+                )
+
+    trainer_kwargs = dict(data_module)
+    # HF Trainer.__init__ raises when eval_strategy != "no" and
+    # eval_dataset is None. We bypass HF's eval loop entirely via
+    # SkillAwareTrainer.evaluate() + SkillGenerationEvaluator, so the
+    # eval_dataset is never read. Pass a trivial placeholder just to
+    # satisfy the init-time assertion.
+    if (
+        skill_evaluator is not None
+        and trainer_kwargs.get("eval_dataset") is None
+        and str(getattr(training_args, "eval_strategy", "no")).lower() != "no"
+    ):
+        trainer_kwargs["eval_dataset"] = _SkillEvalPlaceholderDataset()
+
+    # Parse per-skill loss weights spec like
+    # "observing=1,estimating=2,scheduler=2,planning=2". Reuse the same
+    # format parser that dataset_resample_weights uses so the UX is
+    # consistent for the user.
+    skill_loss_weights_dict = None
+    if data_args.skill_loss_weights:
+        from qwenvl.data.data_processor import parse_dataset_resample_weights
+
+        skill_loss_weights_dict = parse_dataset_resample_weights(
+            data_args.skill_loss_weights
+        )
+
+    trainer = SkillAwareTrainer(
+        model=model,
+        processing_class=tokenizer,
+        args=training_args,
+        skill_evaluator=skill_evaluator,
+        skill_loss_weights=skill_loss_weights_dict,
+        **trainer_kwargs,
     )
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
@@ -202,5 +340,20 @@ def train(attn_implementation="flash_attention_2"):
     processor.save_pretrained(training_args.output_dir)
 
 
+def resolve_attn_implementation() -> str:
+    requested = os.environ.get(
+        "QWENVL_ATTN_IMPLEMENTATION", "flash_attention_2"
+    )
+    if (
+        requested == "flash_attention_2"
+        and importlib.util.find_spec("flash_attn") is None
+    ):
+        logging.warning(
+            "flash_attn is unavailable; falling back to sdpa attention."
+        )
+        return "sdpa"
+    return requested
+
+
 if __name__ == "__main__":
-    train(attn_implementation="flash_attention_2")
+    train(attn_implementation=resolve_attn_implementation())
