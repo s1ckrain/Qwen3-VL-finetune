@@ -1056,6 +1056,67 @@ class SkillGenerationEvaluator:
             print(f"[skill_eval] failed to write log: {exc}")
 
 
+class MultiDomainSkillGenerationEvaluator:
+    """Run existing skill evaluators sequentially and namespace their metrics.
+
+    Each child keeps the exact single-domain scoring and distributed execution
+    path.  This wrapper only prevents metric collisions when the same skills
+    are evaluated on multiple corpora (for example GOAT and OVON).
+    """
+
+    def __init__(
+        self,
+        evaluators_by_domain: Dict[str, SkillGenerationEvaluator],
+    ) -> None:
+        if not evaluators_by_domain:
+            raise ValueError("At least one domain evaluator is required.")
+
+        normalized: Dict[str, SkillGenerationEvaluator] = {}
+        for raw_domain, evaluator in evaluators_by_domain.items():
+            domain = re.sub(
+                r"[^a-z0-9_]+",
+                "_",
+                str(raw_domain).strip().lower(),
+            ).strip("_")
+            if not domain:
+                raise ValueError(
+                    f"Invalid empty eval domain after normalization: {raw_domain!r}"
+                )
+            if domain in normalized:
+                raise ValueError(f"Duplicate eval domain: {domain!r}")
+            normalized[domain] = evaluator
+        self.evaluators_by_domain = normalized
+
+    @staticmethod
+    def _domain_metric_key(domain: str, key: str) -> str:
+        if key.startswith("eval_"):
+            return f"eval_{domain}_{key[len('eval_') :]}"
+        if key.startswith("train_"):
+            return f"train_{domain}_{key[len('train_') :]}"
+        return f"{domain}_{key}"
+
+    def run(self, trainer) -> Dict[str, float]:
+        started = time.time()
+        merged: Dict[str, float] = {}
+
+        for domain, evaluator in self.evaluators_by_domain.items():
+            if _is_main_process():
+                print(f"[skill_eval] ===== domain: {domain} =====", flush=True)
+            domain_metrics = evaluator.run(trainer=trainer)
+            for key, value in domain_metrics.items():
+                namespaced = self._domain_metric_key(domain, key)
+                if namespaced in merged:
+                    raise RuntimeError(
+                        f"Duplicate multi-domain eval metric: {namespaced}"
+                    )
+                merged[namespaced] = value
+
+        # Keep the conventional aggregate runtime key expected by Trainer while
+        # retaining each child's eval_<domain>_runtime metric.
+        merged["eval_runtime"] = time.time() - started
+        return merged
+
+
 class _NullContext:
     def __enter__(self):
         return self

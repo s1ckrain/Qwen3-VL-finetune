@@ -25,9 +25,12 @@ export NAVAGENT_QWENVL_DATA_DIR
 # LOSS_WEIGHT_*: 各 skill loss 权重 (会归一化, 不影响有效 LR)
 # RESAMPLE_WEIGHT_*: 各 skill 数据重复倍数, 设为 0 等于关闭该 skill
 # DATASETS: 设非空可完全覆盖数据集字符串; 留空则按 RESAMPLE_WEIGHT 自动拼
+# DATASET_RESAMPLE_MODE:
+#   balanced (默认) 按 DATASET_RESAMPLE_WEIGHTS / RESAMPLE_WEIGHT_* 重采样
+#   natural          每个输入样本只使用一次，不进行上/下采样
 #
-# 当前默认: 4 skill 联合训练, 全 1:1:1:1
-# 单 skill 训练: 把其他 3 个 RESAMPLE_WEIGHT_* 设 0
+# 当前默认: observing / estimating / planning 三 skill 等量训练
+# 单 skill 训练: 把其他 skill 的 RESAMPLE_WEIGHT_* 设 0
 : "${DATA_PERCENT:=100}"
 : "${LOSS_WEIGHT_OBSERVING:=1}"
 : "${LOSS_WEIGHT_ESTIMATING:=1}"
@@ -38,6 +41,7 @@ export NAVAGENT_QWENVL_DATA_DIR
 : "${RESAMPLE_WEIGHT_SCHEDULER:=0}"
 : "${RESAMPLE_WEIGHT_PLANNING:=1}"
 : "${DATASETS:=}"
+: "${DATASET_RESAMPLE_MODE:=balanced}"
 
 # ---- 训练参数 ---------------------------------------------------------------
 : "${NUM_TRAIN_EPOCHS:=2}"
@@ -111,6 +115,11 @@ if ! [[ "${DATA_PERCENT}" =~ ^[0-9]+$ ]] || (( DATA_PERCENT < 1 || DATA_PERCENT 
   echo "DATA_PERCENT 必须是 [1, 100] 之间的整数, 当前: ${DATA_PERCENT}" >&2
   exit 1
 fi
+if [[ "${DATASET_RESAMPLE_MODE}" != "balanced" \
+      && "${DATASET_RESAMPLE_MODE}" != "natural" ]]; then
+  echo "DATASET_RESAMPLE_MODE 必须是 balanced 或 natural, 当前: ${DATASET_RESAMPLE_MODE}" >&2
+  exit 1
+fi
 
 # 数据存在性检查
 # USE_TRAIN_SPLIT=1: 读 navagent_<skill>_train.jsonl (已剔除 val/probe 的版本),
@@ -161,8 +170,14 @@ fi
 
 # Build per-skill weight strings DYNAMICALLY from _skills so removing a
 # skill from the array (e.g. scheduler) doesn't leave a dangling weight
-# entry referencing a non-existent dataset.
-if [[ -z "${DATASET_RESAMPLE_WEIGHTS:-}" ]]; then
+# entry referencing a non-existent dataset. Natural mode deliberately leaves
+# the spec empty; data_processor then concatenates every row exactly once.
+if [[ "${DATASET_RESAMPLE_MODE}" == "natural" ]]; then
+  if [[ -n "${DATASET_RESAMPLE_WEIGHTS:-}" ]]; then
+    echo "WARNING: natural 模式忽略 DATASET_RESAMPLE_WEIGHTS=${DATASET_RESAMPLE_WEIGHTS}" >&2
+  fi
+  DATASET_RESAMPLE_WEIGHTS=""
+elif [[ -z "${DATASET_RESAMPLE_WEIGHTS:-}" ]]; then
   _w=()
   for s in "${_skills[@]}"; do
     _ucase=$(echo "$s" | tr '[:lower:]' '[:upper:]')
@@ -186,7 +201,6 @@ mkdir -p "${OUTPUT_DIR}"
 ARGS=(
   --model_name_or_path "${MODEL_PATH}"
   --dataset_use "${DATASETS}"
-  --dataset_resample_weights "${DATASET_RESAMPLE_WEIGHTS}"
   --skill_loss_weights "${SKILL_LOSS_WEIGHTS}"
   --data_flatten False
   --data_packing False
@@ -216,6 +230,8 @@ ARGS=(
   --seed "${SEED}"
 )
 
+[[ -n "${DATASET_RESAMPLE_WEIGHTS}" ]] \
+  && ARGS+=(--dataset_resample_weights "${DATASET_RESAMPLE_WEIGHTS}")
 [[ "${USE_BF16}" == "1" ]] && ARGS+=(--bf16)
 [[ "${GRADIENT_CHECKPOINTING}" == "1" ]] \
   && ARGS+=(--gradient_checkpointing True) \
@@ -278,7 +294,8 @@ cat <<BANNER
   model        : ${MODEL_PATH}
   data_dir     : ${NAVAGENT_QWENVL_DATA_DIR}
   datasets     : ${DATASETS}
-  resample_w   : ${DATASET_RESAMPLE_WEIGHTS}
+  resample     : ${DATASET_RESAMPLE_MODE}
+  resample_w   : ${DATASET_RESAMPLE_WEIGHTS:-(none; natural union)}
   loss_w       : ${SKILL_LOSS_WEIGHTS}
   data_percent : ${DATA_PERCENT}%
 --------------------------------------------------------------------------------

@@ -41,7 +41,10 @@ class DataArguments:
             "help": (
                 "Directory containing navagent_<skill>_val.jsonl files produced "
                 "by tools/split_navagent_val.py. When set, a generation-based "
-                "eval callback is attached to the trainer."
+                "eval callback is attached to the trainer. For multi-domain "
+                "evaluation, pass a comma-separated mapping such as "
+                "'goat=/path/to/goat,ovon=/path/to/ovon'; metrics are then "
+                "reported with domain prefixes."
             )
         },
     )

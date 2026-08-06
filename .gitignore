@@ -62,6 +62,10 @@ tb_logs/
 
 # 数据集/权重目录
 data/
+# `qwenvl/data` 是训练源码包，不是数据集目录。
+!qwen-vl-finetune/qwenvl/data/
+!qwen-vl-finetune/qwenvl/data/*.py
+!qwen-vl-finetune/qwenvl/data/**/*.py
 datasets/
 checkpoints/
 pretrained/

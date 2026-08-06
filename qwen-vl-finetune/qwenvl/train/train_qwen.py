@@ -18,6 +18,7 @@ import os
 import logging
 import pathlib
 import importlib.util
+import re
 import torch
 import transformers
 import sys
@@ -42,6 +43,7 @@ from qwenvl.train.argument import (
     TrainingArguments,
 )
 from qwenvl.train.skill_eval import (
+    MultiDomainSkillGenerationEvaluator,
     SkillEvalConfig,
     SkillGenerationEvaluator,
     load_train_probe_datasets,
@@ -69,6 +71,36 @@ local_rank = None
 def rank0_print(*args):
     if local_rank == 0:
         print(*args)
+
+
+def _parse_eval_val_dir_spec(spec: str) -> Dict[str, Path]:
+    """Parse a legacy single val dir or ``domain=/path,...`` mapping."""
+    text = str(spec or "").strip()
+    if not text:
+        return {}
+    if "=" not in text:
+        return {"": Path(text)}
+
+    parsed: Dict[str, Path] = {}
+    for item in text.split(","):
+        piece = item.strip()
+        if not piece or "=" not in piece:
+            raise ValueError(
+                "eval_val_dir mappings must look like "
+                "'goat=/path/to/goat,ovon=/path/to/ovon'."
+            )
+        domain, raw_path = (part.strip() for part in piece.split("=", 1))
+        if not re.fullmatch(r"[A-Za-z0-9_-]+", domain):
+            raise ValueError(
+                f"Invalid eval domain {domain!r}; use letters, digits, '_' or '-'."
+            )
+        if not raw_path:
+            raise ValueError(f"Missing eval path for domain {domain!r}.")
+        normalized_domain = domain.lower().replace("-", "_")
+        if normalized_domain in parsed:
+            raise ValueError(f"Duplicate eval domain: {normalized_domain!r}")
+        parsed[normalized_domain] = Path(raw_path)
+    return parsed
 
 
 class _SkillEvalPlaceholderDataset:
@@ -237,30 +269,39 @@ def train(attn_implementation="flash_attention_2"):
             for s in (data_args.eval_skills or "").split(",")
             if s.strip()
         )
+        domain_evaluators: Dict[str, SkillGenerationEvaluator] = {}
         if skills:
-            val_data_by_skill = load_val_datasets(
-                Path(data_args.eval_val_dir), skills=skills
-            )
-            non_empty = {k: v for k, v in val_data_by_skill.items() if v}
-            train_probe_by_skill: Dict[str, list] = {}
-            if (
-                non_empty
-                and getattr(data_args, "eval_train_probe_size", 0) > 0
-            ):
-                # Only bother loading the train pool for skills whose val
-                # pool is non-empty — otherwise we'd silently report a
-                # train number with no val counterpart for comparison.
-                probe_skills = tuple(non_empty.keys())
-                train_probe_by_skill = load_train_probe_datasets(
-                    Path(data_args.eval_val_dir), skills=probe_skills
+            eval_dirs = _parse_eval_val_dir_spec(data_args.eval_val_dir)
+            for domain, val_dir in eval_dirs.items():
+                val_data_by_skill = load_val_datasets(val_dir, skills=skills)
+                non_empty = {k: v for k, v in val_data_by_skill.items() if v}
+                train_probe_by_skill: Dict[str, list] = {}
+                if (
+                    non_empty
+                    and getattr(data_args, "eval_train_probe_size", 0) > 0
+                ):
+                    # Only load train probes for skills with a non-empty val
+                    # pool, and keep each domain's probe data isolated.
+                    probe_skills = tuple(non_empty.keys())
+                    train_probe_by_skill = load_train_probe_datasets(
+                        val_dir, skills=probe_skills
+                    )
+                    train_probe_by_skill = {
+                        k: v for k, v in train_probe_by_skill.items() if v
+                    }
+                if not non_empty:
+                    rank0_print(
+                        f"eval_val_dir={val_dir} has no requested val jsonl "
+                        f"files (domain={domain or 'default'}); skipping."
+                    )
+                    continue
+
+                log_name = (
+                    "skill_eval_history.jsonl"
+                    if not domain
+                    else f"skill_eval_{domain}_history.jsonl"
                 )
-                # Drop empty entries so the evaluator doesn't try to
-                # subset-pick from a missing file.
-                train_probe_by_skill = {
-                    k: v for k, v in train_probe_by_skill.items() if v
-                }
-            if non_empty:
-                skill_evaluator = SkillGenerationEvaluator(
+                domain_evaluators[domain] = SkillGenerationEvaluator(
                     processor=processor,
                     val_data_by_skill=non_empty,
                     train_probe_by_skill=train_probe_by_skill or None,
@@ -271,26 +312,34 @@ def train(attn_implementation="flash_attention_2"):
                         train_probe_size=getattr(
                             data_args, "eval_train_probe_size", 0
                         ),
-                        log_path=Path(training_args.output_dir) / "skill_eval_history.jsonl",
+                        log_path=Path(training_args.output_dir) / log_name,
                         shard_seed=training_args.seed,
                         planning_pixel_tolerance_px=float(
-                            getattr(data_args, "eval_planning_pixel_tolerance", 64.0)
+                            getattr(
+                                data_args,
+                                "eval_planning_pixel_tolerance",
+                                64.0,
+                            )
                         ),
                     ),
                 )
                 rank0_print(
-                    "Skill generation evaluator enabled for skills: "
-                    f"{list(non_empty.keys())} "
+                    "Skill generation evaluator enabled: "
+                    f"domain={domain or 'default'} dir={val_dir} "
+                    f"skills={list(non_empty.keys())} "
                     f"(num_samples_per_skill={data_args.eval_num_samples_per_skill}, "
                     f"train_probe_size={getattr(data_args, 'eval_train_probe_size', 0)}, "
                     f"max_new_tokens={data_args.eval_max_new_tokens}, "
                     f"planning_pix_tol={getattr(data_args, 'eval_planning_pixel_tolerance', 64.0)})"
                 )
-            else:
-                rank0_print(
-                    "eval_val_dir is set but no val jsonl files were found; "
-                    "skipping skill evaluator setup."
-                )
+
+        if len(domain_evaluators) == 1 and "" in domain_evaluators:
+            # Preserve legacy metric names and log path for one plain directory.
+            skill_evaluator = domain_evaluators[""]
+        elif domain_evaluators:
+            skill_evaluator = MultiDomainSkillGenerationEvaluator(
+                domain_evaluators
+            )
 
     trainer_kwargs = dict(data_module)
     # HF Trainer.__init__ raises when eval_strategy != "no" and
