@@ -9,9 +9,9 @@ cd "${REPO_ROOT}"
 # DAgger (Stage-2) data prep. Sibling of prepare_navagent_data.sh —
 # that SFT script is NOT touched. Differences:
 #   - reads the DAgger raw/labeled dirs, writes a SEPARATE dagger_qwenvl dir
-#   - calls dagger_data_gen/run_export_qwenvl.py (the fork) with
-#     --disagreement-only so only student<->oracle disagreement steps survive
-#   - exports est + plan only; no val split (DAgger has no val; eval = GOAT 667)
+#   - exports full student-rollout DAgger observing / estimating / planning
+#     samples by default (no disagreement-only filter)
+#   - no val split by default (DAgger has no val; eval = GOAT 667)
 # ============================================================
 NAVAGENT_LABELED_DIR="${NAVAGENT_LABELED_DIR:-/root/data1/SFT-v4/dagger_labeled}"
 NAVAGENT_RAW_DIR="${NAVAGENT_RAW_DIR:-/root/data1/SFT-v4/dagger_raw}"
@@ -19,12 +19,11 @@ NAVAGENT_QWENVL_DATA_DIR="${NAVAGENT_QWENVL_DATA_DIR:-/root/data1/SFT-v4/dagger_
 VERIFY_FILES="${VERIFY_FILES:-0}"
 INCLUDE_PLANNING_INCONSISTENCY="${INCLUDE_PLANNING_INCONSISTENCY:-0}"
 
-# DAgger step-level student<->oracle disagreement filter (the whole point of
-# Stage-2): keep only steps where the student was wrong. Set DISAGREEMENT_ONLY=0
-# to export every collected step instead.
-DISAGREEMENT_ONLY="${DISAGREEMENT_ONLY:-1}"
+# Optional ablation: keep only steps where the student disagrees with the
+# oracle. Mainline DAgger exports every valid collected step.
+DISAGREEMENT_ONLY="${DISAGREEMENT_ONLY:-0}"
 PIXEL_TOL="${PIXEL_TOL:-64}"        # must match skill-eval EVAL_PIXEL_TOLERANCE
-DAGGER_SKILLS=("estimating" "planning")
+DAGGER_SKILLS=("observing" "estimating" "planning")
 
 # 跳过导出: 若已有 qwenvl 数据可直接复用, 不重跑 run_export_qwenvl.py
 SKIP_EXPORT="${SKIP_EXPORT:-0}"
@@ -93,9 +92,9 @@ if [[ "${SKIP_EXPORT}" == "1" ]]; then
     echo "SKIP_EXPORT=1: 复用现有 ${NAVAGENT_QWENVL_DATA_DIR}"
   fi
 else
-  # DAgger export: per-skill (est/plan) via the FORKED exporter, with the
-  # step-level student<->oracle disagreement filter. data_gen/run_export_qwenvl.py
-  # (the SFT exporter) is intentionally NOT used here.
+  # DAgger export: per-skill via the FORKED exporter. data_gen/run_export_qwenvl.py
+  # (the SFT exporter) is intentionally NOT used here. Mainline export is full;
+  # --disagreement-only is available only as an explicit ablation.
   for skill in "${DAGGER_SKILLS[@]}"; do
     CMD=(
       python "/root/NavAgent/dagger_data_gen/run_export_qwenvl.py"
@@ -104,7 +103,8 @@ else
       --output-dir "${NAVAGENT_QWENVL_DATA_DIR}"
       --skill "${skill}"
     )
-    if [[ "${DISAGREEMENT_ONLY}" == "1" ]]; then
+    if [[ "${DISAGREEMENT_ONLY}" == "1" \
+          && ( "${skill}" == "estimating" || "${skill}" == "planning" ) ]]; then
       CMD+=(--disagreement-only --pixel-tol "${PIXEL_TOL}")
     fi
     if [[ "${VERIFY_FILES}" == "1" ]]; then

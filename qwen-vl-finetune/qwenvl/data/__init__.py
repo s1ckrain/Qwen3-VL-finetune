@@ -94,11 +94,10 @@ NAVAGENT_OVON_PLANNING_TRAIN = _navagent_dataset_from(
     NAVAGENT_OVON_QWENVL_DATA_DIR, "navagent_planning_train.jsonl"
 )
 
-# --- DAgger (Stage-2) datasets (ADDITIVE; SFT entries above are untouched) ---
-# Separate directory so the Stage-2 disagreement-filtered data never mixes
-# with the SFT qwenvl dir. Kept as distinct skill keys (`*_dagger`) so the
-# trainer's per-dataset resample weight can target them independently and the
-# skill-eval (estimating/planning val) is unaffected.
+# --- DAgger (Stage-2) datasets ---------------------------------------------
+# Separate directory so Stage-2 student-rollout data never mixes with the SFT
+# qwenvl dir. Kept as distinct dataset keys (`*_dagger`) so launchers can train
+# on DAgger only or mix it explicitly for ablations.
 NAVAGENT_DAGGER_DATA_DIR = os.environ.get(
     "NAVAGENT_DAGGER_DATA_DIR", "/root/data1/SFT-v4/dagger_qwenvl"
 )
@@ -111,6 +110,7 @@ def _navagent_dagger_dataset(filename: str) -> dict:
     }
 
 
+NAVAGENT_OBSERVING_DAGGER = _navagent_dagger_dataset("navagent_observing.jsonl")
 NAVAGENT_ESTIMATING_DAGGER = _navagent_dagger_dataset("navagent_estimating.jsonl")
 NAVAGENT_PLANNING_DAGGER = _navagent_dagger_dataset("navagent_planning.jsonl")
 
@@ -138,6 +138,7 @@ data_dict = {
     "navagent_ovon_observing_train": NAVAGENT_OVON_OBSERVING_TRAIN,
     "navagent_ovon_estimating_train": NAVAGENT_OVON_ESTIMATING_TRAIN,
     "navagent_ovon_planning_train": NAVAGENT_OVON_PLANNING_TRAIN,
+    "navagent_observing_dagger": NAVAGENT_OBSERVING_DAGGER,
     "navagent_estimating_dagger": NAVAGENT_ESTIMATING_DAGGER,
     "navagent_planning_dagger": NAVAGENT_PLANNING_DAGGER,
 }
